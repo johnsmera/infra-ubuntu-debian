@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Defaults ---
+# Harden Ubuntu/Debian for SSH key-only auth + UFW + Fail2ban + Unattended upgrades
+# Works on Ubuntu (systemd unit: ssh) and Debian (unit: sshd) — auto-detects.
+
 NEW_USER=""
 PUBKEY_CONTENT=""
 PUBKEY_FILE=""
@@ -25,7 +27,7 @@ Options:
 EOF
 }
 
-# --- Parse args ---
+# ---- Parse args ----
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --user) NEW_USER="${2:-}"; shift 2;;
@@ -38,26 +40,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# --- OS check ---
-if [[ -r /etc/os-release ]]; then
-  . /etc/os-release
-  ID_LIKE="${ID_LIKE:-$ID}"
-else
-  warn "Não consegui detectar distro; seguindo assim mesmo."
-  ID_LIKE=""
-fi
-
-if ! echo "$ID_LIKE" | grep -Eq 'debian|ubuntu'; then
-  warn "Script otimizado para Debian/Ubuntu. Pode falhar em outras distros."
-fi
-
-# --- Root check ---
+# ---- Root check ----
 if [[ "$EUID" -ne 0 ]]; then
   err "Rode como root (use sudo)."; exit 1
 fi
 
-# --- Resolve chave pública ---
-if [[ -n "$PUBKEY_FILE" ]] && [[ -z "$PUBKEY_CONTENT" ]]; then
+# ---- Distro check (best effort) ----
+if [[ -r /etc/os-release ]]; then . /etc/os-release; fi
+
+# ---- Resolve chave pública ----
+if [[ -n "$PUBKEY_FILE" && -z "$PUBKEY_CONTENT" ]]; then
   if [[ -f "$PUBKEY_FILE" ]]; then
     PUBKEY_CONTENT="$(tr -d '\r' < "$PUBKEY_FILE")"
   else
@@ -65,7 +57,6 @@ if [[ -n "$PUBKEY_FILE" ]] && [[ -z "$PUBKEY_CONTENT" ]]; then
   fi
 fi
 
-# Se nada informado, tenta reaproveitar do root
 if [[ -z "$PUBKEY_CONTENT" ]]; then
   if [[ -f /root/.ssh/authorized_keys ]]; then
     warn "Nenhuma --pubkey/--pubkey-file informada; vou manter authorized_keys do root."
@@ -74,15 +65,14 @@ if [[ -z "$PUBKEY_CONTENT" ]]; then
   fi
 fi
 
-# --- Pacotes básicos ---
+# ---- Pacotes ----
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y --no-install-recommends \
   openssh-server ufw fail2ban unattended-upgrades ca-certificates
-
 log "Pacotes instalados."
 
-# --- Cria usuário sudo (opcional) ---
+# ---- Cria usuário sudo (opcional) ----
 if [[ -n "$NEW_USER" ]]; then
   if id "$NEW_USER" &>/dev/null; then
     warn "Usuário $NEW_USER já existe, seguindo."
@@ -92,8 +82,6 @@ if [[ -n "$NEW_USER" ]]; then
     passwd -l "$NEW_USER" >/dev/null 2>&1 || true
     log "Usuário $NEW_USER criado e adicionado ao grupo sudo."
   fi
-
-  # Instala chave no usuário
   install -d -m 700 "/home/$NEW_USER/.ssh"
   if [[ -n "$PUBKEY_CONTENT" ]]; then
     echo "$PUBKEY_CONTENT" > "/home/$NEW_USER/.ssh/authorized_keys"
@@ -103,25 +91,34 @@ if [[ -n "$NEW_USER" ]]; then
   log "Chave pública instalada em /home/$NEW_USER/.ssh/authorized_keys"
 fi
 
-# --- Garante .ssh do root (mantém acesso por chave ao root enquanto testa) ---
+# ---- Garante chave no root (failsafe) ----
 if [[ -n "$PUBKEY_CONTENT" ]]; then
   install -d -m 700 /root/.ssh
-  if [[ ! -f /root/.ssh/authorized_keys ]]; then
-    touch /root/.ssh/authorized_keys
-    chmod 600 /root/.ssh/authorized_keys
-  fi
+  touch /root/.ssh/authorized_keys
+  chmod 600 /root/.ssh/authorized_keys
   if ! grep -qF "$PUBKEY_CONTENT" /root/.ssh/authorized_keys; then
     echo "$PUBKEY_CONTENT" >> /root/.ssh/authorized_keys
   fi
   log "Chave também garantida em /root/.ssh/authorized_keys (failsafe)."
 fi
 
-# --- SSH hardening ---
-SSHD=/etc/ssh/sshd_config
-cp -a "$SSHD" "${SSHD}.bak.$(date +%F_%T)"
+# ---- Detecta unit do OpenSSH (Ubuntu=ssh / Debian=sshd) ----
+SSH_UNIT="ssh"
+if systemctl list-unit-files | grep -q '^ssh.service'; then
+  SSH_UNIT="ssh"
+elif systemctl list-unit-files | grep -q '^sshd.service'; then
+  SSH_UNIT="sshd"
+else
+  # fallback: tenta status para decidir
+  if systemctl status ssh >/dev/null 2>&1; then SSH_UNIT="ssh"; else SSH_UNIT="sshd"; fi
+fi
+log "Unit do OpenSSH detectada: $SSH_UNIT.service"
 
-# Normaliza diretivas (remove duplicadas/antigas e reescreve)
-grep -v -E '^(#|$)' "$SSHD" >/dev/null 2>&1 || true
+# ---- SSH hardening ----
+SSHD_CFG="/etc/ssh/sshd_config"
+cp -a "$SSHD_CFG" "${SSHD_CFG}.bak.$(date +%F_%T)"
+
+# Normaliza diretivas
 sed -i \
   -e 's/^#\?\s*PubkeyAuthentication.*/PubkeyAuthentication yes/' \
   -e 's/^#\?\s*PasswordAuthentication.*/PasswordAuthentication no/' \
@@ -129,50 +126,58 @@ sed -i \
   -e 's/^#\?\s*UsePAM.*/UsePAM yes/' \
   -e 's/^#\?\s*PermitRootLogin.*/PermitRootLogin prohibit-password/' \
   -e 's|^#\?\s*AuthorizedKeysFile.*|AuthorizedKeysFile .ssh/authorized_keys|' \
-  "$SSHD"
+  "$SSHD_CFG"
 
 # Porta customizada
 if [[ "$SSH_PORT" != "22" ]]; then
-  if grep -qE '^\s*Port\s+' "$SSHD"; then
-    sed -i "s|^\s*Port\s\+.*|Port ${SSH_PORT}|" "$SSHD"
+  if grep -qE '^\s*Port\s+' "$SSHD_CFG"; then
+    sed -i "s|^\s*Port\s\+.*|Port ${SSH_PORT}|" "$SSHD_CFG"
   else
-    echo "Port ${SSH_PORT}" >> "$SSHD"
+    echo "Port ${SSH_PORT}" >> "$SSHD_CFG"
   fi
 fi
 
 # Desabilita root completamente, se pedido
 if [[ "$DISABLE_ROOT" == "yes" ]]; then
-  sed -i 's/^PermitRootLogin .*/PermitRootLogin no/' "$SSHD"
+  sed -i 's/^PermitRootLogin .*/PermitRootLogin no/' "$SSHD_CFG"
 fi
 
-# Testa configuração antes de aplicar
-if ! sshd -t; then
-  err "Config do SSH inválida. Restaurando backup."
-  cp -a "${SSHD}.bak."* "$SSHD"
-  systemctl restart sshd
-  exit 1
+# Testa configuração do sshd antes de aplicar
+SSHD_BIN="$(command -v sshd || true)"
+if [[ -z "$SSHD_BIN" ]]; then
+  # caminhos comuns
+  for p in /usr/sbin/sshd /usr/local/sbin/sshd; do
+    [[ -x "$p" ]] && SSHD_BIN="$p" && break
+  done
 fi
 
-systemctl restart sshd
-log "SSHD reiniciado com sucesso."
+if [[ -x "$SSHD_BIN" ]]; then
+  if ! "$SSHD_BIN" -t; then
+    err "Config do SSH inválida. Restaurando backup."
+    cp -a "${SSHD_CFG}.bak."* "$SSHD_CFG"
+    systemctl restart "$SSH_UNIT" || true
+    exit 1
+  fi
+else
+  warn "Não encontrei binário do sshd para validar config; seguindo assim mesmo."
+fi
 
-# --- Firewall (UFW) ---
+systemctl restart "$SSH_UNIT"
+log "OpenSSH reiniciado com sucesso ($SSH_UNIT)."
+
+# ---- Firewall (UFW) ----
 ufw --force reset >/dev/null 2>&1 || true
 ufw default deny incoming
 ufw default allow outgoing
-
-# Libera porta SSH (e rate-limit)
 ufw allow "${SSH_PORT}/tcp" comment 'ssh'
 ufw limit "${SSH_PORT}/tcp" || true
-
-# Exemplos de portas web (descomente se usar web):
+# Exemplos web (descomente se necessário)
 # ufw allow 80/tcp comment 'http'
 # ufw allow 443/tcp comment 'https'
-
 ufw --force enable
-log "Firewall UFW habilitado. Porta SSH ${SSH_PORT} liberada e com rate-limit."
+log "UFW habilitado. Porta SSH ${SSH_PORT} liberada e com rate-limit."
 
-# --- Fail2ban básico para sshd ---
+# ---- Fail2ban básico para sshd ----
 mkdir -p /etc/fail2ban/jail.d
 cat >/etc/fail2ban/jail.d/sshd.local <<JAIL
 [sshd]
@@ -192,17 +197,17 @@ JAIL
 systemctl enable --now fail2ban
 log "Fail2ban configurado e iniciado."
 
-# --- Updates automáticos ---
+# ---- Updates automáticos ----
 cat >/etc/apt/apt.conf.d/20auto-upgrades <<'AUTO'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 AUTO
 
 apt-get install -y unattended-upgrades >/dev/null 2>&1 || true
-dpkg-reconfigure -f noninteractive unattended-upgrades || true
+DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive unattended-upgrades || true
 log "Unattended-upgrades ativado."
 
-# --- Resumo ---
+# ---- Resumo ----
 echo
 log "Endurecimento concluído!"
 echo "Resumo:"
@@ -214,8 +219,8 @@ else
 fi
 echo " - Porta SSH: ${SSH_PORT}"
 [[ -n "$NEW_USER" ]] && echo " - Usuário sudo criado: ${NEW_USER}"
-echo " - UFW ativo; inbound por padrão negado; SSH liberado e rate-limited."
-echo " - Fail2ban ativo para sshd (ban após tentativas)."
+echo " - UFW ativo; inbound negado por padrão; SSH liberado e rate-limited."
+echo " - Fail2ban ativo para sshd (ban progressivo)."
 echo " - Updates automáticos habilitados."
 echo
 echo "Teste de conexão em outro terminal ANTES de sair desta sessão:"
