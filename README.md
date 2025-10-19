@@ -1,5 +1,4 @@
-# Harden SSH — Guia rápido para meu eu do futuro
-
+# Harden SSH — Guia rápido 
 > Este arquivo explica o que faz o script `harden.sh`, como usá-lo com segurança e como reverter se algo der errado. Escrito em linguagem direta para quem não lembrar do contexto.
 
 ---
@@ -19,10 +18,16 @@ Deixar uma VPS (Ubuntu/Debian) **segura por padrão**: aceitar apenas autentica�
   * `ChallengeResponseAuthentication no`
   * `PermitRootLogin prohibit-password` (ou `no` se especificado)
   * `AuthorizedKeysFile .ssh/authorized_keys`
-* Reinicia o serviço `sshd` depois de validar a configuração.
+* Reinicia o serviço OpenSSH depois de validar a configuração (**nota importante sobre o nome do serviço** logo abaixo).
 * Reseta e configura UFW: `deny incoming` por padrão, permite saída, permite + rate-limit na porta SSH escolhida.
-* Cria configuração básica do `fail2ban` para proteger `sshd`.
+* Cria configuração básica do `fail2ban` para proteger logins SSH.
 * Habilita updates automáticos via `unattended-upgrades`.
+
+> ⚠️ **Ubuntu vs Debian — nome do serviço**
+>
+> * Em **Ubuntu** o unit costuma se chamar **`ssh.service`**.
+> * Em **Debian** (ou derivados), às vezes aparece como **`sshd.service`**.
+> * Use os comandos abaixo que **testam ambos**.
 
 ---
 
@@ -73,19 +78,18 @@ sudo bash harden.sh --user deploy --pubkey-file ~/.ssh/id_ed25519.pub --disable-
 
 ## O que verificar imediatamente após rodar
 
-1. Em outro terminal, teste com a chave:
+1. Em outro terminal, teste com a chave (ajuste porta se tiver mudado):
 
 ```bash
-# se porta padrão
 ssh -i ~/.ssh/id_ed25519 root@SEU_IP
 # ou, se criou deploy e trocou porta
 ssh -p 2222 -i ~/.ssh/id_ed25519 deploy@SEU_IP
 ```
 
-2. Verifique status do sshd:
+2. Verifique status do OpenSSH (tente ambos os nomes, Ubuntu e Debian):
 
 ```bash
-sudo systemctl status sshd -l
+sudo systemctl status ssh --no-pager -l || sudo systemctl status sshd --no-pager -l
 ```
 
 3. Verifique se UFW está ativo e regras:
@@ -94,22 +98,24 @@ sudo systemctl status sshd -l
 sudo ufw status verbose
 ```
 
-4. Verifique fail2ban:
+4. Verifique fail2ban (cadeia de proteção pro SSH):
 
 ```bash
-sudo systemctl status fail2ban
+sudo systemctl status fail2ban --no-pager -l
 sudo fail2ban-client status sshd
 ```
+
+> Observação: o jail padrão do fail2ban chama-se `sshd` mesmo quando o serviço systemd é `ssh` — está correto assim.
 
 ---
 
 ## Como reverter (rápido) se algo der errado
 
-* Se você ainda tem a sessão original aberta, restaure o backup automático do `sshd_config` e reinicie:
+* Se você ainda tem a sessão original aberta, restaure o backup automático do `sshd_config` e reinicie o OpenSSH (testando os dois nomes de unidade):
 
 ```bash
 sudo cp /etc/ssh/sshd_config.bak.* /etc/ssh/sshd_config
-sudo systemctl restart sshd
+sudo systemctl restart ssh || sudo systemctl restart sshd
 ```
 
 * Se você já fechou a sessão e não consegue conectar, use o **VNC/Console** do seu provedor ou o modo Rescue para reverter os passos (restaurar arquivo `sshd_config`, copiar a chave para `/root/.ssh/authorized_keys`, habilitar `PasswordAuthentication` temporariamente).
@@ -126,11 +132,26 @@ sudo chmod 700 /root/.ssh
 sudo chmod 600 /root/.ssh/authorized_keys
 ```
 
-* **`Connection refused`**: SSH não está rodando (`systemctl status sshd`) ou firewall bloqueando (ver `ufw status`).
+* **`Connection refused`**: OpenSSH não está rodando ou porta errada. Veja status (testando ambos):
+
+```bash
+sudo systemctl status ssh --no-pager -l || sudo systemctl status sshd --no-pager -l
+```
 
 * **Ao trocar porta SSH**: sempre use `ssh -p PORT ...` ao testar.
 
-* **Se `sshd` não reinicia por erro de configuração**: restaure o backup do `sshd_config` e reinicie como mostrado acima.
+* **Validar sintaxe da config** (útil antes de reiniciar):
+
+```bash
+sudo /usr/sbin/sshd -t || sudo sshd -t
+```
+
+Se houver erro, restaure o backup do `sshd_config` e reinicie:
+
+```bash
+sudo cp /etc/ssh/sshd_config.bak.* /etc/ssh/sshd_config
+sudo systemctl restart ssh || sudo systemctl restart sshd
+```
 
 ---
 
@@ -151,4 +172,4 @@ Se estiver em dúvida, volte para este documento e siga os passos de verificaç�
 
 ---
 
-Gerado para você. Boa sorte — e lembra: sempre mantenha uma sessão aberta para testar antes de encerrar a sessão original.
+Atualizado para refletir o nome do serviço no **Ubuntu (`ssh`)** e em alguns **Debian/derivados (`sshd`)**.
